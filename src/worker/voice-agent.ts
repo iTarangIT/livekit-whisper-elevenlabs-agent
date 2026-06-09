@@ -1,10 +1,12 @@
 import { defineAgent, type JobContext, type JobProcess } from '@livekit/agents';
 import { VAD } from '@livekit/agents-plugin-silero';
 import {
-  AudioFrame,
+  type AudioFrame,
   AudioSource,
   AudioStream,
   LocalAudioTrack,
+  type RemoteParticipant,
+  type RemoteTrack,
   RoomEvent,
   TrackKind,
   TrackPublishOptions,
@@ -12,18 +14,13 @@ import {
   combineAudioFrames,
 } from '@livekit/rtc-node';
 import { config } from '../config/env.js';
-import { RuleBasedConversationService } from '../conversation/conversation.service.js';
-import { ElevenLabsService } from '../services/elevenlabs.service.js';
-import { TranscriptService } from '../services/transcript.service.js';
+import { createAgentSession } from '../elevenlabs-agent/agent-session.js';
 import { WhisperService } from '../services/whisper.service.js';
 import { CHANNELS, SAMPLE_RATE } from '../types/index.js';
 import { createLogger } from '../utils/logger.js';
 import { VadService } from '../vad/vad.service.js';
 
 const logger = createLogger('agent');
-
-const FRAME_MS = 20;
-const SAMPLES_PER_FRAME = (SAMPLE_RATE * FRAME_MS) / 1000;
 
 interface AgentUserData {
   vad?: VAD;
@@ -34,13 +31,15 @@ function framesToPcm(frames: AudioFrame[]): Buffer {
   return Buffer.from(merged.data.buffer, merged.data.byteOffset, merged.data.byteLength);
 }
 
-async function playback(source: AudioSource, pcm: Buffer): Promise<void> {
-  const total = Math.floor(pcm.byteLength / 2);
-  const samples = new Int16Array(pcm.buffer, pcm.byteOffset, total);
-  for (let offset = 0; offset < samples.length; offset += SAMPLES_PER_FRAME) {
-    const end = Math.min(offset + SAMPLES_PER_FRAME, samples.length);
-    const chunk = samples.slice(offset, end);
-    await source.captureFrame(new AudioFrame(chunk, SAMPLE_RATE, CHANNELS, chunk.length));
+function readDealerNumber(metadata: string): string {
+  if (!metadata) {
+    return '';
+  }
+  try {
+    const parsed = JSON.parse(metadata) as { phoneNumber?: unknown };
+    return typeof parsed.phoneNumber === 'string' ? parsed.phoneNumber : '';
+  } catch {
+    return '';
   }
 }
 
@@ -55,25 +54,112 @@ export default defineAgent<AgentUserData>({
   },
 
   entry: async (ctx: JobContext<AgentUserData>) => {
+    const agentId = config.elevenLabs.agentId;
+    if (!agentId) {
+      throw new Error('ELEVENLABS_AGENT_ID is required to run the agent bridge');
+    }
+
     const vad = ctx.proc.userData.vad;
     if (!vad) {
       throw new Error('vad model was not initialized during prewarm');
     }
 
-    const stt = new WhisperService(config.openai.apiKey, config.openai.whisperModel);
-    const tts = new ElevenLabsService(
-      config.elevenLabs.apiKey,
-      config.elevenLabs.voiceId,
-      config.elevenLabs.modelId,
-    );
-    const transcript = new TranscriptService();
-    const conversation = new RuleBasedConversationService();
-
+    const stt = new WhisperService(config.openai.apiKey, config.openai.whisperModel, config.stt);
     const source = new AudioSource(SAMPLE_RATE, CHANNELS);
     const track = LocalAudioTrack.createAudioTrack('agent-voice', source);
+    const session = createAgentSession(config.elevenLabs.apiKey, agentId, source);
+
+    let queue: Promise<void> = Promise.resolve();
+    const handleUtterance = async (frames: AudioFrame[]): Promise<void> => {
+      if (frames.length === 0) {
+        return;
+      }
+      const text = await stt.transcribe(framesToPcm(frames));
+      if (text.length === 0) {
+        return;
+      }
+      logger.info('transcript received', { text });
+      session.bridge.interrupt();
+      session.sendUserMessage(text);
+    };
+
+    const callbacks = {
+      onSpeechStart: () => logger.info('speech started'),
+      onSpeechEnd: (frames: AudioFrame[]) => {
+        logger.info('speech ended');
+        queue = queue.then(() => handleUtterance(frames)).catch((error: unknown) => {
+          logger.error('failed to handle utterance', {
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        });
+      },
+    };
+
+    let sessionStarted = false;
+    const ensureSessionStarted = (): void => {
+      if (sessionStarted) {
+        return;
+      }
+      sessionStarted = true;
+      session
+        .start()
+        .then(() => logger.info('elevenlabs agent session started', { agentId }))
+        .catch((error: unknown) => {
+          logger.error('failed to start agent session', {
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        });
+    };
+
+    const vadSessions = new Map<string, VadService>();
+    const startListening = (audioTrack: RemoteTrack, participant: RemoteParticipant): void => {
+      const key = audioTrack.sid ?? participant.identity;
+      if (vadSessions.has(key)) {
+        return;
+      }
+      logger.info('audio track subscribed', { participant: participant.identity });
+      const input = new AudioStream(audioTrack, {
+        sampleRate: SAMPLE_RATE,
+        numChannels: CHANNELS,
+        frameSizeMs: 20,
+      });
+      const vadSession = new VadService(vad, callbacks);
+      vadSession.start(input);
+      vadSessions.set(key, vadSession);
+      ensureSessionStarted();
+    };
+
+    const stop = (): void => {
+      for (const vadSession of vadSessions.values()) {
+        void vadSession.close();
+      }
+      vadSessions.clear();
+      session.end();
+    };
+
+    ctx.room.on(RoomEvent.ParticipantConnected, (participant) => {
+      logger.info('participant joined', { participant: participant.identity });
+    });
+
+    ctx.room.on(RoomEvent.TrackSubscribed, (subscribed, _publication, participant) => {
+      if (subscribed.kind !== TrackKind.KIND_AUDIO) {
+        return;
+      }
+      startListening(subscribed, participant);
+    });
+
+    ctx.room.on(RoomEvent.ParticipantDisconnected, (participant) => {
+      logger.info('participant left', { participant: participant.identity });
+      stop();
+    });
+
+    ctx.room.on(RoomEvent.Disconnected, () => {
+      logger.info('room disconnected');
+      stop();
+    });
 
     await ctx.connect();
-    logger.info('connected to room', { room: ctx.room.name });
+    logger.info('connected to room', { room: ctx.room.name, dealer: readDealerNumber(ctx.job.metadata) });
 
     const localParticipant = ctx.room.localParticipant;
     if (!localParticipant) {
@@ -84,80 +170,12 @@ export default defineAgent<AgentUserData>({
       new TrackPublishOptions({ source: TrackSource.SOURCE_MICROPHONE }),
     );
 
-    let queue: Promise<void> = Promise.resolve();
-
-    const handleSpeech = async (frames: AudioFrame[]): Promise<void> => {
-      if (frames.length === 0) {
-        return;
+    for (const participant of ctx.room.remoteParticipants.values()) {
+      for (const publication of participant.trackPublications.values()) {
+        if (publication.subscribed && publication.track && publication.track.kind === TrackKind.KIND_AUDIO) {
+          startListening(publication.track, participant);
+        }
       }
-      const text = await stt.transcribe(framesToPcm(frames));
-      if (text.length === 0) {
-        return;
-      }
-      logger.info('transcript received', { text });
-      transcript.addMessage('user', text);
-
-      const reply = await conversation.respond(text, transcript.getHistory());
-      transcript.addMessage('assistant', reply);
-      logger.info('response generated', { reply });
-
-      const audio = await tts.generateSpeech(reply);
-      if (audio.length === 0) {
-        return;
-      }
-      await playback(source, audio);
-    };
-
-    const callbacks = {
-      onSpeechStart: () => logger.info('speech started'),
-      onSpeechEnd: (frames: AudioFrame[]) => {
-        logger.info('speech ended');
-        queue = queue
-          .then(() => handleSpeech(frames))
-          .catch((error: unknown) => {
-            logger.error('failed to handle speech segment', {
-              reason: error instanceof Error ? error.message : String(error),
-            });
-          });
-      },
-    };
-
-    const sessions = new Map<string, VadService>();
-
-    ctx.room.on(RoomEvent.ParticipantConnected, (participant) => {
-      logger.info('participant joined', { participant: participant.identity });
-    });
-
-    ctx.room.on(RoomEvent.TrackSubscribed, (subscribed, _publication, participant) => {
-      if (subscribed.kind !== TrackKind.KIND_AUDIO) {
-        return;
-      }
-      logger.info('audio track subscribed', { participant: participant.identity });
-      const input = new AudioStream(subscribed, {
-        sampleRate: SAMPLE_RATE,
-        numChannels: CHANNELS,
-        frameSizeMs: FRAME_MS,
-      });
-      const session = new VadService(vad, callbacks);
-      session.start(input);
-      sessions.set(participant.identity, session);
-    });
-
-    ctx.room.on(RoomEvent.ParticipantDisconnected, (participant) => {
-      logger.info('participant left', { participant: participant.identity });
-      const session = sessions.get(participant.identity);
-      if (session) {
-        void session.close();
-        sessions.delete(participant.identity);
-      }
-    });
-
-    ctx.room.on(RoomEvent.Disconnected, () => {
-      logger.info('room disconnected');
-      for (const session of sessions.values()) {
-        void session.close();
-      }
-      sessions.clear();
-    });
+    }
   },
 });
