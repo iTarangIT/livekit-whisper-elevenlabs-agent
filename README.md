@@ -134,11 +134,22 @@ cp .env.example .env
 | `LIVEKIT_URL` | yes | `wss://<your-project>.livekit.cloud` |
 | `LIVEKIT_API_KEY` | yes | from the LiveKit project settings |
 | `LIVEKIT_API_SECRET` | yes | from the LiveKit project settings |
+| `AGENT_NAME` | no | explicit-dispatch name, default `dealer-outbound` |
 | `OPENAI_API_KEY` | yes | used for Whisper transcription |
-| `WHISPER_MODEL` | no | default `gpt-4o-mini-transcribe` (also `gpt-4o-transcribe`, `whisper-1`) |
+| `WHISPER_MODEL` | no | default `gpt-4o-transcribe` (better multilingual; also `gpt-4o-mini-transcribe`, `whisper-1`) |
+| `STT_LANGUAGE` | no | blank = auto-detect (best for Hinglish), or `hi` |
+| `STT_PROMPT` | no | optional Hinglish biasing phrase |
 | `ELEVENLABS_API_KEY` | yes | ElevenLabs TTS |
 | `ELEVENLABS_VOICE_ID` | yes | a **voice** ID, e.g. `JBFqnCBsd6RMkjVDRZzb` (George) |
 | `ELEVENLABS_MODEL_ID` | no | default `eleven_flash_v2_5` (lowest latency) |
+| `ELEVENLABS_AGENT_ID` | no | only used by `npm run voice:from-agent` to pull the voice id |
+| `SIP_TRUNK_ADDRESS` | for calls | Vobiz SIP host/URI |
+| `SIP_TRUNK_USERNAME` / `SIP_TRUNK_PASSWORD` | for calls | Vobiz SIP auth |
+| `SIP_CALLER_NUMBER` | for calls | caller id in E.164, e.g. `+9180…` |
+| `SIP_OUTBOUND_TRUNK_ID` | for calls | output of `npm run trunk:setup` |
+| `SIP_TRANSPORT` | no | `auto` \| `udp` \| `tcp` \| `tls` (default `auto`) |
+| `CALL_RINGING_TIMEOUT` / `CALL_MAX_DURATION` | no | seconds (default `30` / `600`) |
+| `AGENT_OPENING_LINE` | no | what the agent says first when the dealer answers |
 | `LOG_LEVEL` | no | `debug` \| `info` \| `warn` \| `error` (default `info`) |
 
 > **`ELEVENLABS_VOICE_ID` must be a voice ID, not an agent ID.** An ID like `agent_…`
@@ -205,6 +216,56 @@ While you talk, the worker logs the full lifecycle:
 [INFO] [agent] response generated {"reply":"Hello sir, how can I help you today?"}
 [INFO] [elevenlabs] elevenlabs latency: 1571ms
 ```
+
+---
+
+## Outbound calling (dealers via Vobiz SIP)
+
+The agent can phone a dealer over PSTN: a **campaign step** dials the number through a
+**Vobiz SIP trunk → LiveKit SIP**, drops the dialed dealer into a LiveKit room, and
+**dispatches this worker** into the same room. When the dealer answers, the agent speaks
+first (`AGENT_OPENING_LINE`) and then runs the normal VAD → STT → reply → TTS loop.
+
+```
+npm run call -- +91XXXXXXXXXX
+   → creates room  → dispatches agent (AGENT_NAME)  → dials dealer via SIP trunk
+```
+
+### One-time setup
+
+1. **Pull the voice from your ElevenLabs agent** (optional — keeps your chosen voice):
+   ```bash
+   # set ELEVENLABS_AGENT_ID in .env, then:
+   npm run voice:from-agent          # prints ELEVENLABS_VOICE_ID=… → paste into .env
+   ```
+2. **Get a Vobiz SIP trunk** and put the details in `.env`: `SIP_TRUNK_ADDRESS`,
+   `SIP_TRUNK_USERNAME`, `SIP_TRUNK_PASSWORD`, `SIP_CALLER_NUMBER` (E.164, e.g. `+9180…`).
+   Confirm India DLT / caller-ID rules and any IP allow-listing with Vobiz.
+3. **Create the outbound trunk in LiveKit**:
+   ```bash
+   npm run trunk:setup               # prints SIP_OUTBOUND_TRUNK_ID=… → paste into .env
+   ```
+
+### Placing a call
+
+```bash
+npm run dev                          # terminal 1: the agent worker (explicit dispatch)
+npm run call -- +91XXXXXXXXXX        # terminal 2: the campaign dialer
+```
+
+Your phone rings; on answer you hear the opening line, then a normal conversation. The
+worker logs `connected to room` (with the dialed number), `speaking opening line`, and the
+usual pipeline events. `npm run call` stands in for the **Campaign Backend** in the
+architecture — swap it for your own job queue / scheduler later.
+
+> The worker uses **explicit dispatch** (`AGENT_NAME`), so it only joins rooms it is
+> dispatched into. The dialer does that dispatch for every outbound call.
+
+## Hinglish ASR
+
+For Hindi-English code-switching, default to `WHISPER_MODEL=gpt-4o-transcribe` and leave
+`STT_LANGUAGE` blank (auto-detect usually beats forcing `hi`). Use `STT_PROMPT` to bias
+spelling of brand/model names, e.g. `STT_PROMPT=Bajaj Pulsar, on-road price, EMI, test ride`.
 
 ---
 
