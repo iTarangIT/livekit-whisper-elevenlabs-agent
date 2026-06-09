@@ -4,6 +4,11 @@ import { createLogger } from '../utils/logger.js';
 
 const logger = createLogger('whisper');
 
+interface WhisperOptions {
+  language?: string;
+  prompt?: string;
+}
+
 function toWav(pcm: Buffer, sampleRate: number, channels: number): Buffer {
   const blockAlign = channels * BYTES_PER_SAMPLE;
   const byteRate = sampleRate * blockAlign;
@@ -27,7 +32,11 @@ function toWav(pcm: Buffer, sampleRate: number, channels: number): Buffer {
 export class WhisperService implements SttService {
   private readonly client: OpenAI;
 
-  constructor(apiKey: string, private readonly model: string) {
+  constructor(
+    apiKey: string,
+    private readonly model: string,
+    private readonly options: WhisperOptions = {},
+  ) {
     this.client = new OpenAI({ apiKey });
   }
 
@@ -46,6 +55,8 @@ export class WhisperService implements SttService {
         const result = await this.client.audio.transcriptions.create({
           file,
           model: this.model,
+          language: this.options.language,
+          prompt: this.options.prompt,
         });
         logger.latency('whisper', performance.now() - startedAt);
         return result.text.trim();
