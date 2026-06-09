@@ -10,4 +10,4 @@ const agent = fileURLToPath(new URL(`./worker/voice-agent${extension}`, import.m
 
 logger.info('starting voice agent worker', { livekit: config.livekit.url });
 
-cli.runApp(new WorkerOptions({ agent }));
+cli.runApp(new WorkerOptions({ agent, agentName: config.agentName }));
