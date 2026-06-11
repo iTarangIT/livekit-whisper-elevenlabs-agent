@@ -13,14 +13,11 @@ const schema = z.object({
   AGENT_NAME: z.string().min(1).default('dealer-outbound'),
 
   OPENAI_API_KEY: z.string().min(1, 'OPENAI_API_KEY is required'),
-  WHISPER_MODEL: z.string().min(1).default('gpt-4o-transcribe'),
-  STT_LANGUAGE: z.string().min(1).optional(),
-  STT_PROMPT: z.string().min(1).optional(),
-
-  ELEVENLABS_API_KEY: z.string().min(1, 'ELEVENLABS_API_KEY is required'),
-  ELEVENLABS_AGENT_ID: z.string().min(1, 'ELEVENLABS_AGENT_ID is required'),
-  ELEVENLABS_VOICE_ID: z.string().min(1).optional(),
-  ELEVENLABS_MODEL_ID: z.string().min(1).default('eleven_flash_v2_5'),
+  REALTIME_MODEL: z.string().min(1).default('gpt-realtime'),
+  REALTIME_VOICE: z.string().min(1).default('cedar'),
+  AGENT_INSTRUCTIONS_PATH: z.string().min(1).default('prompts/agent-instructions.md'),
+  TURN_DETECTION: z.enum(['semantic_vad', 'server_vad']).default('semantic_vad'),
+  VAD_SILENCE_MS: z.coerce.number().int().positive().default(500),
 
   SIP_TRUNK_ADDRESS: z.string().min(1).optional(),
   SIP_TRUNK_USERNAME: z.string().min(1).optional(),
@@ -46,19 +43,13 @@ export interface AppConfig {
     apiSecret: string;
   };
   agentName: string;
-  openai: {
+  realtime: {
     apiKey: string;
-    whisperModel: string;
-  };
-  stt: {
-    language?: string;
-    prompt?: string;
-  };
-  elevenLabs: {
-    apiKey: string;
-    agentId: string;
-    voiceId?: string;
-    modelId: string;
+    model: string;
+    voice: string;
+    instructionsPath: string;
+    turnDetection: 'semantic_vad' | 'server_vad';
+    silenceMs: number;
   };
   sip: {
     trunkAddress?: string;
@@ -98,19 +89,13 @@ function load(): AppConfig {
       apiSecret: env.LIVEKIT_API_SECRET,
     },
     agentName: env.AGENT_NAME,
-    openai: {
+    realtime: {
       apiKey: env.OPENAI_API_KEY,
-      whisperModel: env.WHISPER_MODEL,
-    },
-    stt: {
-      language: env.STT_LANGUAGE,
-      prompt: env.STT_PROMPT,
-    },
-    elevenLabs: {
-      apiKey: env.ELEVENLABS_API_KEY,
-      agentId: env.ELEVENLABS_AGENT_ID,
-      voiceId: env.ELEVENLABS_VOICE_ID,
-      modelId: env.ELEVENLABS_MODEL_ID,
+      model: env.REALTIME_MODEL,
+      voice: env.REALTIME_VOICE,
+      instructionsPath: env.AGENT_INSTRUCTIONS_PATH,
+      turnDetection: env.TURN_DETECTION,
+      silenceMs: env.VAD_SILENCE_MS,
     },
     sip: {
       trunkAddress: env.SIP_TRUNK_ADDRESS,

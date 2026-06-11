@@ -2,7 +2,7 @@
   "name": "elevenlabs-whisper-voice-agent",
   "version": "1.0.0",
   "private": true,
-  "description": "Real-time voice agent: LiveKit + Silero VAD + Whisper STT + ElevenLabs TTS",
+  "description": "Real-time voice agent: LiveKit + OpenAI Realtime (voice-to-voice)",
   "type": "module",
   "engines": {
     "node": ">=20"
@@ -14,16 +14,14 @@
     "start": "node dist/index.js start",
     "trunk:setup": "tsx src/bin/setup-trunk.ts",
     "call": "tsx src/bin/call.ts",
-    "voice:from-agent": "tsx src/bin/voice-from-agent.ts"
+    "metrics:report": "tsx src/bin/metrics-report.ts"
   },
   "dependencies": {
-    "@elevenlabs/elevenlabs-js": "^2.51.0",
     "@livekit/agents": "^1.4.5",
-    "@livekit/agents-plugin-silero": "^1.4.5",
+    "@livekit/agents-plugin-openai": "^1.4.5",
     "@livekit/protocol": "^1.46.6",
     "@livekit/rtc-node": "^0.13.29",
     "livekit-server-sdk": "^2.15.4",
-    "openai": "^6.42.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
