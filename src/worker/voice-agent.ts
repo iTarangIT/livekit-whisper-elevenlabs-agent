@@ -1,35 +1,25 @@
-import { defineAgent, type JobContext, type JobProcess } from '@livekit/agents';
-import { VAD } from '@livekit/agents-plugin-silero';
+import { readFileSync } from 'node:fs';
+import { resolve } from 'node:path';
+import { type JobContext, defineAgent, voice } from '@livekit/agents';
+import * as openai from '@livekit/agents-plugin-openai';
 import {
-  type AudioFrame,
-  AudioSource,
-  AudioStream,
-  LocalAudioTrack,
+  ConnectionQuality,
   type RemoteParticipant,
   type RemoteTrack,
   RoomEvent,
   TrackKind,
-  TrackPublishOptions,
-  TrackSource,
-  combineAudioFrames,
 } from '@livekit/rtc-node';
 import { config } from '../config/env.js';
-import { createAgentSession } from '../elevenlabs-agent/agent-session.js';
-import { WhisperService } from '../services/whisper.service.js';
-import { CHANNELS, SAMPLE_RATE } from '../types/index.js';
+import { CallMetrics } from '../metrics/metrics.js';
 import { createLogger } from '../utils/logger.js';
-import { VadService } from '../vad/vad.service.js';
+
+const STATS_INTERVAL_MS = 5000;
+
+function qualityName(quality: ConnectionQuality): string {
+  return ConnectionQuality[quality] ?? String(quality);
+}
 
 const logger = createLogger('agent');
-
-interface AgentUserData {
-  vad?: VAD;
-}
-
-function framesToPcm(frames: AudioFrame[]): Buffer {
-  const merged = combineAudioFrames(frames);
-  return Buffer.from(merged.data.buffer, merged.data.byteOffset, merged.data.byteLength);
-}
 
 function readDealerNumber(metadata: string): string {
   if (!metadata) {
@@ -43,109 +33,115 @@ function readDealerNumber(metadata: string): string {
   }
 }
 
-export default defineAgent<AgentUserData>({
-  prewarm: async (proc: JobProcess<AgentUserData>) => {
-    proc.userData.vad = await VAD.load({
-      minSpeechDuration: 0.1,
-      minSilenceDuration: 0.5,
-      sampleRate: SAMPLE_RATE,
+function buildTurnDetection() {
+  if (config.realtime.turnDetection === 'server_vad') {
+    return {
+      type: 'server_vad' as const,
+      silence_duration_ms: config.realtime.silenceMs,
+      create_response: true,
+      interrupt_response: true,
+    };
+  }
+  return {
+    type: 'semantic_vad' as const,
+    eagerness: 'medium' as const,
+    create_response: true,
+    interrupt_response: true,
+  };
+}
+
+export default defineAgent({
+  entry: async (ctx: JobContext) => {
+    const metrics = new CallMetrics(
+      ctx.job.room?.name ?? ctx.room.name ?? readDealerNumber(ctx.job.metadata) ?? 'call',
+    );
+
+    const instructions = readFileSync(resolve(config.realtime.instructionsPath), 'utf8');
+
+    const agent = new voice.Agent({ instructions });
+    const session = new voice.AgentSession({
+      llm: new openai.realtime.RealtimeModel({
+        apiKey: config.realtime.apiKey,
+        model: config.realtime.model,
+        voice: config.realtime.voice,
+        turnDetection: buildTurnDetection(),
+        inputAudioTranscription: { model: 'gpt-4o-mini-transcribe' },
+      }),
     });
-    logger.info('vad model loaded');
-  },
 
-  entry: async (ctx: JobContext<AgentUserData>) => {
-    const agentId = config.elevenLabs.agentId;
-    if (!agentId) {
-      throw new Error('ELEVENLABS_AGENT_ID is required to run the agent bridge');
-    }
-
-    const vad = ctx.proc.userData.vad;
-    if (!vad) {
-      throw new Error('vad model was not initialized during prewarm');
-    }
-
-    const stt = new WhisperService(config.openai.apiKey, config.openai.whisperModel, config.stt);
-    const source = new AudioSource(SAMPLE_RATE, CHANNELS);
-    const track = LocalAudioTrack.createAudioTrack('agent-voice', source);
-    const session = createAgentSession(config.elevenLabs.apiKey, agentId, source);
-
-    let queue: Promise<void> = Promise.resolve();
-    const handleUtterance = async (frames: AudioFrame[]): Promise<void> => {
-      if (frames.length === 0) {
+    session.on(voice.AgentSessionEventTypes.UserInputTranscribed, (ev) => {
+      if (!ev.isFinal) {
         return;
       }
-      const text = await stt.transcribe(framesToPcm(frames));
-      if (text.length === 0) {
+      logger.info('user transcript', { text: ev.transcript });
+      metrics.userTranscript(ev.transcript);
+    });
+
+    session.on(voice.AgentSessionEventTypes.AgentStateChanged, (ev) => {
+      if (ev.newState === 'thinking') {
+        metrics.agentThinking();
+      } else if (ev.newState === 'speaking') {
+        metrics.agentSpeaking();
+      }
+    });
+
+    session.on(voice.AgentSessionEventTypes.ConversationItemAdded, (ev) => {
+      const item = ev.item;
+      if (item.type !== 'message' || item.role !== 'assistant') {
         return;
       }
-      logger.info('transcript received', { text });
-      session.bridge.interrupt();
-      session.sendUserMessage(text);
-    };
+      metrics.agentTranscript(item.textContent ?? '', item.interrupted);
+    });
 
-    const callbacks = {
-      onSpeechStart: () => logger.info('speech started'),
-      onSpeechEnd: (frames: AudioFrame[]) => {
-        logger.info('speech ended');
-        queue = queue.then(() => handleUtterance(frames)).catch((error: unknown) => {
-          logger.error('failed to handle utterance', {
-            reason: error instanceof Error ? error.message : String(error),
-          });
-        });
-      },
-    };
+    session.on(voice.AgentSessionEventTypes.MetricsCollected, (ev) => {
+      metrics.realtimeMetrics(ev.metrics);
+    });
 
-    let sessionStarted = false;
-    const ensureSessionStarted = (): void => {
-      if (sessionStarted) {
-        return;
-      }
-      sessionStarted = true;
-      session
-        .start()
-        .then(() => logger.info('elevenlabs agent session started', { agentId }))
-        .catch((error: unknown) => {
-          logger.error('failed to start agent session', {
-            reason: error instanceof Error ? error.message : String(error),
-          });
-        });
-    };
-
-    const vadSessions = new Map<string, VadService>();
-    const startListening = (audioTrack: RemoteTrack, participant: RemoteParticipant): void => {
-      const key = audioTrack.sid ?? participant.identity;
-      if (vadSessions.has(key)) {
-        return;
-      }
-      logger.info('audio track subscribed', { participant: participant.identity });
-      const input = new AudioStream(audioTrack, {
-        sampleRate: SAMPLE_RATE,
-        numChannels: CHANNELS,
-        frameSizeMs: 20,
+    session.on(voice.AgentSessionEventTypes.Error, (ev) => {
+      logger.error('agent session error', {
+        reason: ev.error instanceof Error ? ev.error.message : String(ev.error),
       });
-      const vadSession = new VadService(vad, callbacks);
-      vadSession.start(input);
-      vadSessions.set(key, vadSession);
-      ensureSessionStarted();
-    };
-
-    const stop = (): void => {
-      for (const vadSession of vadSessions.values()) {
-        void vadSession.close();
-      }
-      vadSessions.clear();
-      session.end();
-    };
-
-    ctx.room.on(RoomEvent.ParticipantConnected, (participant) => {
-      logger.info('participant joined', { participant: participant.identity });
     });
 
-    ctx.room.on(RoomEvent.TrackSubscribed, (subscribed, _publication, participant) => {
-      if (subscribed.kind !== TrackKind.KIND_AUDIO) {
+    const seen = new Set<string>();
+    const markAnswered = (track: RemoteTrack, participant: RemoteParticipant): void => {
+      if (track.kind !== TrackKind.KIND_AUDIO) {
         return;
       }
-      startListening(subscribed, participant);
+      const key = track.sid ?? participant.identity;
+      if (seen.has(key)) {
+        return;
+      }
+      seen.add(key);
+      logger.info('audio track subscribed', { participant: participant.identity });
+      metrics.markAnswered();
+    };
+
+    let statsTimer: ReturnType<typeof setInterval> | undefined;
+    let stopped = false;
+    const stop = (): void => {
+      if (stopped) {
+        return;
+      }
+      stopped = true;
+      if (statsTimer) {
+        clearInterval(statsTimer);
+        statsTimer = undefined;
+      }
+      metrics.finalize();
+      void session.close();
+    };
+
+    ctx.room.on(RoomEvent.TrackSubscribed, (track, _publication, participant) => {
+      markAnswered(track, participant);
+    });
+
+    ctx.room.on(RoomEvent.ConnectionQualityChanged, (quality, participant) => {
+      metrics.quality(qualityName(quality));
+      logger.debug('connection quality', {
+        participant: participant.identity,
+        quality: qualityName(quality),
+      });
     });
 
     ctx.room.on(RoomEvent.ParticipantDisconnected, (participant) => {
@@ -159,23 +155,36 @@ export default defineAgent<AgentUserData>({
     });
 
     await ctx.connect();
-    logger.info('connected to room', { room: ctx.room.name, dealer: readDealerNumber(ctx.job.metadata) });
-
-    const localParticipant = ctx.room.localParticipant;
-    if (!localParticipant) {
-      throw new Error('local participant unavailable after connecting');
-    }
-    await localParticipant.publishTrack(
-      track,
-      new TrackPublishOptions({ source: TrackSource.SOURCE_MICROPHONE }),
-    );
+    logger.info('connected to room', {
+      room: ctx.room.name,
+      dealer: readDealerNumber(ctx.job.metadata),
+    });
 
     for (const participant of ctx.room.remoteParticipants.values()) {
       for (const publication of participant.trackPublications.values()) {
-        if (publication.subscribed && publication.track && publication.track.kind === TrackKind.KIND_AUDIO) {
-          startListening(publication.track, participant);
+        if (publication.subscribed && publication.track) {
+          markAnswered(publication.track, participant);
         }
       }
     }
+
+    await session.start({ agent, room: ctx.room });
+    metrics.greetingStart();
+    session.say(config.call.openingLine);
+    logger.info('realtime session started', {
+      model: config.realtime.model,
+      voice: config.realtime.voice,
+    });
+
+    statsTimer = setInterval(() => {
+      ctx.room
+        .getRtcStats()
+        .then((stats) => metrics.rtcStats(stats))
+        .catch((error: unknown) => {
+          logger.debug('failed to read rtc stats', {
+            reason: error instanceof Error ? error.message : String(error),
+          });
+        });
+    }, STATS_INTERVAL_MS);
   },
 });
