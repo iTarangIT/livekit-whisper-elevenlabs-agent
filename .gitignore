@@ -13,6 +13,9 @@ dist/
 *.log
 npm-debug.log*
 
+# Measurement data
+/metrics/
+
 # OS / editor
 .DS_Store
 Thumbs.db
