@@ -1,18 +1,19 @@
-# Outbound AI Voice Agent — LiveKit + Whisper + ElevenLabs
+# Outbound AI Voice Agent — LiveKit + GPT-4o Realtime (voice-to-voice)
 
-An **outbound** voice agent that phones dealers over the phone network, talks to them in
-Hinglish, and is driven by your **ElevenLabs Conversational-AI agent**. Built as a single
-LiveKit Agent Worker in strict TypeScript.
+An **outbound** voice agent that phones dealers over the phone network and talks to them in
+Hinglish. A single **OpenAI Realtime (GPT-4o) voice-to-voice** model does the listening,
+thinking, and speaking in one streaming session. Built as a single LiveKit Agent Worker in
+strict TypeScript.
 
 ```
 Campaign dialer → LiveKit (Room + SIP) → Vobiz trunk → PSTN → dealer's phone
-        once answered, per turn:
-        dealer speaks → Silero VAD → Whisper STT → your ElevenLabs agent (LLM + voice) → dealer hears reply
+        once answered:
+        dealer audio ⇄ GPT-4o Realtime (STT + LLM + TTS, server VAD, barge-in) ⇄ dealer hears reply
 ```
 
-**Who does what:** LiveKit moves the audio and places the call, **Whisper** does the
-listening (speech → text), and **your ElevenLabs agent** does the thinking (its prompt +
-knowledge) and the talking (its voice).
+**Who does what:** LiveKit moves the audio and places the call; **GPT-4o Realtime** does
+everything else — transcription, reasoning (from `prompts/agent-instructions.md`), turn
+detection, and speech — over one WebSocket the LiveKit OpenAI plugin manages for you.
 
 ---
 
@@ -44,22 +45,20 @@ knowledge) and the talking (its voice).
    ┌───────┴───────────────────  Agent worker (npm run dev)  ────────────────────────┐
    │                              src/worker/voice-agent.ts                           │
    │                                                                                  │
-   │  dealer audio ─AudioStream@16k─► Silero VAD ──end of speech──► Whisper STT       │
-   │    (from room)                   vad.service.ts                whisper.service.ts │
-   │                                                                      │ text      │
-   │                                                                      ▼           │
-   │                                                       session.sendUserMessage()  │
-   │                                                                      │           │
-   │                                              ┌──────── WebSocket ────────────┐   │
-   │  dealer hears ◄─AudioSource◄─ audio-bridge ◄─│  ElevenLabs ConvAI agent      │   │
-   │    (into room)                (AudioInterface)│  Main_Agent_Itarang ("Priya") │   │
-   │                                              │  text-in → LLM + voice → audio │  │
-   │                                              └────────────────────────────────┘  │
+   │   voice.AgentSession(llm: openai.realtime.RealtimeModel) drives the call.        │
+   │   RoomIO auto-subscribes the dealer's audio and auto-publishes the agent's.      │
+   │                                                                                  │
+   │            ┌────────────────────── WebSocket ───────────────────────┐           │
+   │  dealer  ──┤  OpenAI Realtime (GPT-4o)                               ├──► dealer │
+   │  audio     │  server VAD → STT → LLM (prompts/agent-instructions.md) │   hears   │
+   │            │  → TTS (voice: cedar), barge-in handled natively        │   reply   │
+   │            └─────────────────────────────────────────────────────────┘          │
    └─────────────────────────────────────────────────────────────────────────────---┘
 ```
 
-Audio is **16 kHz, mono, Int16 PCM** inside the worker. SIP/PSTN is 8 kHz; LiveKit
-resamples to/from 16 kHz at the room edge.
+Inside the worker, the LiveKit OpenAI plugin handles all audio plumbing: it resamples
+to/from the Realtime API's **24 kHz mono PCM**, while SIP/PSTN stays at 8 kHz and LiveKit
+resamples at the room edge.
 
 ---
 
@@ -76,23 +75,21 @@ resamples to/from 16 kHz at the room edge.
    dealer with your number as caller ID.
 4. **Agent dispatch** — the worker registers under `AGENT_NAME` (explicit dispatch), so the
    dialer's `createDispatch` lands a job for it in that exact room.
-5. **Silero VAD** (`src/vad/vad.service.ts`) — detects when the dealer starts/stops talking
-   and emits a complete spoken segment via `onSpeechEnd(frames)`. Silence/half-words never go
-   to Whisper.
-6. **Whisper STT** (`src/services/whisper.service.ts`) — wraps the segment's PCM in a WAV
-   header and transcribes it with OpenAI (`gpt-4o-transcribe`, Hinglish-tuned), retries once,
-   logs latency.
-7. **ElevenLabs agent session** (`src/elevenlabs-agent/agent-session.ts`) — opens an
-   authenticated **WebSocket** to your Conversational-AI agent and runs it **text-in /
-   audio-out**: the worker calls `sendUserMessage(text)` with Whisper's transcript; the
-   agent's LLM + knowledge generate the reply and stream it back as speech. The agent's own
-   ASR is unused — Whisper fills that role.
-8. **Audio bridge** (`src/elevenlabs-agent/audio-bridge.ts`) — implements ElevenLabs'
-   `AudioInterface`; pushes the agent's reply audio into a LiveKit `AudioSource` (played on
-   the `agent-voice` track → room → SIP → dealer). `interrupt()` clears the buffer on barge-in.
-9. **Turn loop & hangup** — steps 5→8 repeat each time the dealer speaks; on hangup
-   (`participantDisconnected`/`disconnected`) the worker closes the VAD streams and ends the
-   ElevenLabs session.
+5. **Realtime session** (`src/worker/voice-agent.ts`) — a `voice.AgentSession` with
+   `openai.realtime.RealtimeModel` as its `llm`. `session.start({ agent, room })` makes the
+   plugin's `RoomIO` auto-subscribe to the dealer's audio track and auto-publish the agent's
+   audio track. The model streams audio both ways: it transcribes, reasons, and speaks in one
+   step. Turn-taking and barge-in are handled by the model's **server VAD** (`semantic_vad`
+   by default, `server_vad` optional). On answer the worker calls `session.say(openingLine)`.
+6. **Instructions** (`prompts/agent-instructions.md`) — the agent's persona, goal, and
+   Hinglish behavior live here as the `voice.Agent` system instructions, loaded at startup.
+7. **Metrics** (`src/metrics/metrics.ts`) — session events feed a per-call JSONL log:
+   `UserInputTranscribed` → transcript + turn, `AgentStateChanged` → response latency,
+   `ConversationItemAdded` → agent reply + barge-in count, `MetricsCollected` → raw OpenAI
+   realtime metrics. `npm run metrics:report` summarizes them.
+8. **Turn loop & hangup** — the model runs the whole conversation; on hangup
+   (`participantDisconnected`/`disconnected`) the worker finalizes metrics and closes the
+   session.
 
 ---
 
@@ -102,10 +99,7 @@ resamples to/from 16 kHz at the room edge.
 src/
 ├── index.ts                          worker entrypoint (env + cli.runApp, explicit dispatch)
 ├── worker/
-│   └── voice-agent.ts                the bridge worker: VAD → Whisper → agent → audio out
-├── elevenlabs-agent/
-│   ├── agent-session.ts              opens the ConvAI WebSocket; sendUserMessage / start / end
-│   └── audio-bridge.ts               AudioInterface → LiveKit AudioSource (plays agent audio)
+│   └── voice-agent.ts                AgentSession + RealtimeModel; wires metrics + lifecycle
 ├── telephony/
 │   ├── livekit-clients.ts            SipClient / AgentDispatchClient / RoomServiceClient
 │   ├── trunk.ts                      ensureOutboundTrunk() → creates the LiveKit↔Vobiz trunk
@@ -113,23 +107,17 @@ src/
 ├── bin/
 │   ├── call.ts                       npm run call  (campaign dialer)
 │   ├── setup-trunk.ts                npm run trunk:setup
-│   └── voice-from-agent.ts           npm run voice:from-agent (reads the agent's voice id)
-├── services/
-│   └── whisper.service.ts            WhisperService — transcribe(Buffer) → text (Hinglish)
-├── vad/
-│   └── vad.service.ts                VadService — Silero wrapper, speech callbacks
+│   └── metrics-report.ts             npm run metrics:report
+├── metrics/
+│   └── metrics.ts                    CallMetrics — per-call JSONL from session events
 ├── config/
 │   └── env.ts                        zod-validated env, fail-fast on startup
-├── types/
-│   └── index.ts                      shared types + audio constants
 └── utils/
     └── logger.ts                     structured leveled logger (no console.log)
-```
 
-> Legacy from the earlier component-pipeline build and **not used in the agent-bridge path**:
-> `services/elevenlabs.service.ts` (our own TTS), `services/transcript.service.ts`,
-> `conversation/conversation.service.ts` (rule engine). They're kept for reference / as the
-> basis of the "ElevenLabs as TTS-only + your own LLM" variant.
+prompts/
+└── agent-instructions.md             the agent's persona / goal / Hinglish behavior
+```
 
 ---
 
@@ -137,8 +125,7 @@ src/
 
 - **Node.js 20+** (tested on Node 22).
 - A **LiveKit Cloud** project (free tier is fine): https://cloud.livekit.io
-- An **OpenAI API key** with access to the transcription endpoint.
-- An **ElevenLabs** account with a **Conversational-AI agent** and its **agent id** (`agent_…`).
+- An **OpenAI API key** with access to the **Realtime** API (`gpt-realtime`).
 - A **SIP trunk** with a provider (here: **Vobiz**) for outbound PSTN calls.
 
 ---
@@ -149,8 +136,8 @@ src/
 npm install
 ```
 
-Installs `@livekit/agents`, `@livekit/agents-plugin-silero`, `@livekit/rtc-node`,
-`livekit-server-sdk`, `@livekit/protocol`, `openai`, `@elevenlabs/elevenlabs-js`, `zod`.
+Installs `@livekit/agents`, `@livekit/agents-plugin-openai`, `@livekit/rtc-node`,
+`livekit-server-sdk`, `@livekit/protocol`, and `zod`.
 
 ---
 
@@ -165,14 +152,13 @@ cp .env.example .env
 | `LIVEKIT_URL` | yes | `wss://<your-project>.livekit.cloud` |
 | `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` | yes | from the LiveKit project |
 | `AGENT_NAME` | no | explicit-dispatch name (default `dealer-outbound`) |
-| `OPENAI_API_KEY` | yes | Whisper transcription |
-| `WHISPER_MODEL` | no | default `gpt-4o-transcribe` (also `gpt-4o-mini-transcribe`, `whisper-1`) |
-| `STT_LANGUAGE` | no | blank = auto-detect (best for Hinglish), or `hi` |
-| `STT_PROMPT` | no | optional Hinglish biasing phrase |
-| `ELEVENLABS_API_KEY` | yes | ElevenLabs API |
-| `ELEVENLABS_AGENT_ID` | **yes** | your Conversational-AI agent (`agent_…`) — the brain + voice |
-| `ELEVENLABS_VOICE_ID` | no | only for the legacy TTS-only path; not used in agent mode |
-| `ELEVENLABS_MODEL_ID` | no | only for the legacy TTS-only path |
+| `OPENAI_API_KEY` | yes | OpenAI Realtime API |
+| `REALTIME_MODEL` | no | default `gpt-realtime` (also `gpt-realtime-mini`, `gpt-4o-realtime-preview`) |
+| `REALTIME_VOICE` | no | default `cedar` (also `marin`, `alloy`, `echo`, `shimmer`, …) |
+| `AGENT_INSTRUCTIONS_PATH` | no | default `prompts/agent-instructions.md` |
+| `TURN_DETECTION` | no | `semantic_vad` (default) or `server_vad` |
+| `VAD_SILENCE_MS` | no | silence before end-of-turn for `server_vad` (default `500`) |
+| `AGENT_OPENING_LINE` | no | greeting spoken on answer (default provided) |
 | `SIP_TRUNK_ADDRESS` | for calls | Vobiz outbound SIP host (e.g. `70530e47.sip.vobiz.ai`) |
 | `SIP_TRUNK_USERNAME` / `SIP_TRUNK_PASSWORD` | for calls | Vobiz SIP credentials |
 | `SIP_CALLER_NUMBER` | for calls | caller id in E.164 (e.g. `+9179…`) |
@@ -181,23 +167,17 @@ cp .env.example .env
 | `CALL_RINGING_TIMEOUT` / `CALL_MAX_DURATION` | no | seconds (default `30` / `600`) |
 | `LOG_LEVEL` | no | `debug` \| `info` \| `warn` \| `error` (default `info`) |
 
-The agent's **greeting/first message** is configured on the ElevenLabs agent itself (in the
-ElevenLabs dashboard), not here — it plays automatically when the dealer answers.
-
-Missing/empty required vars cause a fail-fast startup error that names exactly what's wrong.
+The agent's persona, goal, and language behavior live in **`prompts/agent-instructions.md`**;
+edit that file to change how the agent talks. Missing/empty required vars cause a fail-fast
+startup error that names exactly what's wrong.
 
 ---
 
 ## One-time setup
 
-1. **(Optional) copy the agent's voice id** — only needed for the legacy TTS-only path:
-   ```bash
-   # set ELEVENLABS_AGENT_ID in .env, then:
-   npm run voice:from-agent           # prints ELEVENLABS_VOICE_ID=…
-   ```
-2. **Add your Vobiz SIP trunk details** to `.env` (`SIP_TRUNK_ADDRESS`, `SIP_TRUNK_USERNAME`,
+1. **Add your Vobiz SIP trunk details** to `.env` (`SIP_TRUNK_ADDRESS`, `SIP_TRUNK_USERNAME`,
    `SIP_TRUNK_PASSWORD`, `SIP_CALLER_NUMBER`). Confirm India DLT / caller-ID rules with Vobiz.
-3. **Create the LiveKit outbound trunk** (points LiveKit at Vobiz):
+2. **Create the LiveKit outbound trunk** (points LiveKit at Vobiz):
    ```bash
    npm run trunk:setup                # prints SIP_OUTBOUND_TRUNK_ID=… → paste into .env
    ```
@@ -213,47 +193,36 @@ npm run dev                          # terminal 1: the agent worker (stays runni
 npm run call -- +919322957122        # terminal 2: dial a dealer
 ```
 
-When the dealer answers they hear your agent's opening line, then a normal Hinglish
-conversation. A healthy turn logs:
+When the dealer answers they hear the opening line in the `cedar` voice, then a normal
+Hinglish conversation with natural turn-taking and barge-in. A healthy call logs:
 
 ```
 [agent] connected to room {"room":"dealer-call-…","dealer":"+91…"}
 [agent] audio track subscribed {"participant":"dealer"}
-[agent] elevenlabs agent session started {"agentId":"agent_…"}
-[agent-session] agent response {"response":"नमस्कार sir, Priya बोल रही हूँ…"}
-[agent] speech started → speech ended
-[whisper] whisper latency: …ms
-[agent] transcript received {"text":"मैं Xite battery use करता हूँ"}
-[agent-session] agent response {"response":"बहुत अच्छा sir, …"}
+[agent] realtime session started {"model":"gpt-realtime","voice":"cedar"}
+[agent] user transcript {"text":"मैं Xite battery use करता हूँ"}
 ```
 
 > `npm run call` stands in for the **Campaign Backend** — replace it with your scheduler/queue.
 
 ---
 
-## Hinglish ASR
+## Hinglish
 
-For Hindi-English code-switching, keep `WHISPER_MODEL=gpt-4o-transcribe` and leave
-`STT_LANGUAGE` blank (auto-detect usually beats forcing `hi`). Use `STT_PROMPT` to bias
-brand/model spelling, e.g. `STT_PROMPT=Trontek, Xite, 51.2 volt, lithium battery, EMI`.
+Hinglish is steered through `prompts/agent-instructions.md`, not a config flag: the
+instructions tell the model to speak Hindi-base Hinglish and to mirror the dealer's language.
+GPT-4o Realtime handles code-switched conversational speech in one model. Note that the
+inner transcription model (`gpt-4o-mini-transcribe`) treats a turn as a single language, so
+logged transcripts on heavily code-switched turns can be noisier than the actual spoken reply.
 
 ---
 
-## Design notes & trade-offs
+## Tuning turn-taking
 
-- **Why the agent is the brain.** Your ElevenLabs Conversational-AI agent already holds the
-  persona, prompt, and product knowledge, so it drives the conversation. The worker only
-  feeds it Whisper text and plays its audio back.
-- **Text-in / audio-out.** We run the agent over a WebSocket, sending transcript **text**
-  (not audio) so Whisper owns STT. We control turn-taking via Silero VAD.
-- **Latency.** Each turn waits for end-of-speech, then Whisper (~1–2 s), then the agent —
-  roughly 4–5 s round trip.
-- **Audio quality (bridge vs native).** Because audio crosses an extra bridge
-  (Vobiz → LiveKit → worker → WebSocket → ElevenLabs and back) with 8 k↔16 k resampling and
-  no echo cancellation, call quality is capped. For the best telephony quality, ElevenLabs'
-  **native SIP outbound** (`conversationalAi.sipTrunk.outboundCall`) runs the same agent in a
-  telephony-native path with built-in echo cancellation + jitter buffer — at the cost of
-  taking LiveKit out of the live-call path.
+- **`semantic_vad`** (default) lets the model decide when the dealer is done — most natural.
+  Adjust `eagerness` in `src/worker/voice-agent.ts` if it cuts in too early/late.
+- **`server_vad`** (`TURN_DETECTION=server_vad`) uses fixed silence-based endpointing; raise
+  `VAD_SILENCE_MS` on noisy phone lines so it waits longer before responding.
 
 ---
 
@@ -263,7 +232,7 @@ brand/model spelling, e.g. `STT_PROMPT=Trontek, Xite, 51.2 volt, lithium battery
 |---|---|
 | `Invalid environment configuration` at startup | A required `.env` value is missing/empty — the message lists which. |
 | `SIP_OUTBOUND_TRUNK_ID is required` | Run `npm run trunk:setup` and paste the printed id into `.env`. |
-| Call connects but agent doesn't respond to you | Check the worker shows `audio track subscribed` then `transcript received`; if not, your audio isn't reaching the worker. |
-| Agent greeting plays before you pick up | Fixed — the session now starts only when the dealer's audio is subscribed (on answer). |
-| Choppy audio / "can't hear you" | Bridge echo/jitter (see Design notes); consider ElevenLabs native SIP. |
-| `401`/auth errors | Check the relevant API key (OpenAI / ElevenLabs / LiveKit) in `.env`. |
+| Worker fails to read instructions at startup | Check `AGENT_INSTRUCTIONS_PATH` points at an existing file relative to the working directory. |
+| Agent cuts in too early / waits too long | Tune `semantic_vad` eagerness or switch to `server_vad` + `VAD_SILENCE_MS`. |
+| `401`/auth errors | Check the relevant API key (OpenAI / LiveKit) in `.env`. |
+```
