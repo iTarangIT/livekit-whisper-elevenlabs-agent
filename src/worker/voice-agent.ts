@@ -170,7 +170,9 @@ export default defineAgent({
 
     await session.start({ agent, room: ctx.room });
     metrics.greetingStart();
-    session.say(config.call.openingLine);
+    session.generateReply({
+      instructions: `Open the call by greeting the dealer. Say exactly this, word for word, then stop: "${config.call.openingLine}"`,
+    });
     logger.info('realtime session started', {
       model: config.realtime.model,
       voice: config.realtime.voice,
